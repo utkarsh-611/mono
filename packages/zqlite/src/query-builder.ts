@@ -222,37 +222,56 @@ function gatherStartConstraints(
           from[iField],
           columnTypes[iField].type,
         );
+        // For non-nullable columns, skip IS NULL checks to avoid
+        // breaking SQLite's MULTI-INDEX OR optimization which falls
+        // back to a full table scan when any OR branch involves NULL.
+        // See: https://github.com/rocicorp/mono/pull/5542
+        const isOptional = columnTypes[iField].optional === true;
         if (iDirection === 'asc') {
           if (!reverse) {
             group.push(
-              sql`(${constraintValue} IS NULL OR ${sql.ident(iField)} > ${constraintValue})`,
+              isOptional
+                ? sql`(${constraintValue} IS NULL OR ${sql.ident(iField)} > ${constraintValue})`
+                : sql`${sql.ident(iField)} > ${constraintValue}`,
             );
           } else {
             reverse satisfies true;
             group.push(
-              sql`(${sql.ident(iField)} IS NULL OR ${sql.ident(iField)} < ${constraintValue})`,
+              isOptional
+                ? sql`(${sql.ident(iField)} IS NULL OR ${sql.ident(iField)} < ${constraintValue})`
+                : sql`${sql.ident(iField)} < ${constraintValue}`,
             );
           }
         } else {
           iDirection satisfies 'desc';
           if (!reverse) {
             group.push(
-              sql`(${sql.ident(iField)} IS NULL OR ${sql.ident(iField)} < ${constraintValue})`,
+              isOptional
+                ? sql`(${sql.ident(iField)} IS NULL OR ${sql.ident(iField)} < ${constraintValue})`
+                : sql`${sql.ident(iField)} < ${constraintValue}`,
             );
           } else {
             reverse satisfies true;
             group.push(
-              sql`(${constraintValue} IS NULL OR ${sql.ident(iField)} > ${constraintValue})`,
+              isOptional
+                ? sql`(${constraintValue} IS NULL OR ${sql.ident(iField)} > ${constraintValue})`
+                : sql`${sql.ident(iField)} > ${constraintValue}`,
             );
           }
         }
       } else {
         const [jField] = order[j];
+        const jIsOptional = columnTypes[jField].optional === true;
+        const jValue = toSQLiteType(
+          from[jField],
+          columnTypes[jField].type,
+        );
+        // Use = instead of IS for non-nullable columns to enable
+        // better index usage in SQLite.
         group.push(
-          sql`${sql.ident(jField)} IS ${toSQLiteType(
-            from[jField],
-            columnTypes[jField].type,
-          )}`,
+          jIsOptional
+            ? sql`${sql.ident(jField)} IS ${jValue}`
+            : sql`${sql.ident(jField)} = ${jValue}`,
         );
       }
     }
@@ -262,13 +281,16 @@ function gatherStartConstraints(
   if (basis === 'at') {
     constraints.push(
       sql`(${sql.join(
-        order.map(
-          s =>
-            sql`${sql.ident(s[0])} IS ${toSQLiteType(
-              from[s[0]],
-              columnTypes[s[0]].type,
-            )}`,
-        ),
+        order.map(s => {
+          const sIsOptional = columnTypes[s[0]].optional === true;
+          const sValue = toSQLiteType(
+            from[s[0]],
+            columnTypes[s[0]].type,
+          );
+          return sIsOptional
+            ? sql`${sql.ident(s[0])} IS ${sValue}`
+            : sql`${sql.ident(s[0])} = ${sValue}`;
+        }),
         sql` AND `,
       )})`,
     );
