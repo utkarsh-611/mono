@@ -121,7 +121,7 @@ jobs:
           cat output.json |
           bencher run \
           --project zero \
-          --testbed self-hosted \
+          --testbed self-hosted-metal \
           --token '${{ secrets.BENCHER_API_TOKEN }}' \
           --adapter json \
           --github-actions '${{ secrets.GITHUB_TOKEN }}' \

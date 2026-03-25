@@ -73,7 +73,8 @@ jobs:
           npx tsx ../shared/src/tool/vitest-perf-json-to-bmf.ts |\
           bencher run \
           --project zero \
-          --testbed self-hosted \
+          --ci-number ${{ github.run_number }} \
+          --testbed self-hosted-metal \
           --token '${{ secrets.BENCHER_API_TOKEN }}' \
           --adapter json \
           --github-actions '${{ github.token }}' \
@@ -93,7 +94,7 @@ jobs:
           npx tsx ../shared/src/tool/vitest-perf-json-to-bmf.ts |\
           bencher run \
           --project zero \
-          --testbed self-hosted \
+          --testbed self-hosted-metal \
           --token '${{ secrets.BENCHER_API_TOKEN }}' \
           --adapter json \
           --github-actions '${{ github.token }}' \
@@ -109,3 +110,4 @@ jobs:
           --threshold-min-sample-size 20 \
           --threshold-max-sample-size 60 \
           --err
+
