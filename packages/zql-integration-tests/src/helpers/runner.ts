@@ -1,10 +1,10 @@
-import {bench, run, summary} from 'mitata';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import {afterAll, expect} from 'vitest';
 import {testLogConfig} from '../../../otel/src/test-log-config.ts';
 import {unreachable} from '../../../shared/src/asserts.ts';
+import {bench, describe} from '../../../shared/src/bench.ts';
 import {wrapIterable} from '../../../shared/src/iterables.ts';
 import type {JSONValue, ReadonlyJSONValue} from '../../../shared/src/json.ts';
 import {createSilentLogContext} from '../../../shared/src/logging-test-utils.ts';
@@ -334,8 +334,8 @@ export async function runBenchmarks<TSchema extends Schema>(
   benchSpecs
     .flat()
     .filter(t => (only ? only.includes(t.name) : true))
-    .map(({name, createQuery, generatePush}) =>
-      summary(() => {
+    .forEach(({name, createQuery, generatePush}) =>
+      describe(name, () => {
         makeBenchmark({
           name,
           zqlSchema,
@@ -348,23 +348,6 @@ export async function runBenchmarks<TSchema extends Schema>(
         });
       }),
     );
-
-  // Check if JSON output is requested via environment variable
-  const format = process.env.BENCH_OUTPUT_FORMAT;
-
-  if (format === 'json') {
-    // Output JSON without samples for smaller, cleaner output
-    await run({
-      format: {
-        json: {
-          samples: false,
-          debug: false,
-        },
-      },
-    });
-  } else {
-    await run();
-  }
 }
 
 export async function bootstrap<TSchema extends Schema>({

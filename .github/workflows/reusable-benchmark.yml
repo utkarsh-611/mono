@@ -52,25 +52,21 @@ jobs:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v6
         with:
-          node-version: 22.x
+          node-version: 24.x
           cache: 'npm'
       - uses: bencherdev/bencher@main
 
       - run: npm ci
 
-      - name: Install Playwright
-        run: npx playwright install --with-deps
-
       - name: Run benchmarks
         working-directory: ${{ inputs.working_directory }}
-        run: npm run bench -- --browser.name=chromium --outputJson output.json
+        run: npm run --silent bench:bmf:silent > output.json
 
       - name: Upload benchmarks results to bencher.dev (main)
         if: ${{ !inputs.is_pr }}
         working-directory: ${{ inputs.working_directory }}
         run: |
           cat output.json |\
-          npx tsx ../shared/src/tool/vitest-perf-json-to-bmf.ts |\
           bencher run \
           --project zero \
           --ci-number ${{ github.run_number }} \
@@ -91,7 +87,6 @@ jobs:
         working-directory: ${{ inputs.working_directory }}
         run: |
           cat output.json |\
-          npx tsx ../shared/src/tool/vitest-perf-json-to-bmf.ts |\
           bencher run \
           --project zero \
           --testbed self-hosted-metal \
@@ -110,4 +105,3 @@ jobs:
           --threshold-min-sample-size 20 \
           --threshold-max-sample-size 60 \
           --err
-
