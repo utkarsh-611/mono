@@ -956,6 +956,14 @@ export class CVRStore {
     }
   }
 
+  #flushTiming = {
+    rowCheckMs: 0,
+    txBeginMs: 0,
+    lockCheckMs: 0,
+    pipelineMs: 0,
+    postTxMs: 0,
+  };
+
   async #flush(
     lc: LogContext,
     expectedCurrentVersion: CVRVersion,
@@ -971,6 +979,7 @@ export class CVRStore {
       rowsDeferred: 0,
       statements: 0,
     };
+    const tFlushStart = performance.now();
     if (this.#pendingRowRecordUpdates.size) {
       const existingRowRecords = await this.getRowRecords();
       this.#rowCount = existingRowRecords.size;
@@ -992,6 +1001,7 @@ export class CVRStore {
         }
       }
     }
+    const tAfterRowCheck = performance.now();
     if (
       this.#pendingRowRecordUpdates.size === 0 &&
       this.#writes.size === 0 &&
@@ -1005,8 +1015,10 @@ export class CVRStore {
     // Note: The CVR instance itself is only updated if there are material
     // changes (i.e. changes to the CVR contents) to flush.
     this.putInstance(cvr);
-    const start = Date.now();
-    lc.debug?.('flush tx beginning');
+
+    let tTxBegun = 0;
+    let tAfterLockCheck = 0;
+    let tAfterPipeline = 0;
 
     // Use an async callback so we can await the version/ownership check and
     // validate it INSIDE the transaction. If validation fails, the exception
@@ -1014,7 +1026,7 @@ export class CVRStore {
     const results = await runTx(
       this.#db,
       async tx => {
-        lc.debug?.(`flush tx begun after ${Date.now() - start} ms`);
+        tTxBegun = performance.now();
 
         // Acquire row-level lock and validate version/ownership before queuing writes.
         // Throwing here (inside the begin callback) rolls back the transaction so that
@@ -1025,6 +1037,7 @@ export class CVRStore {
           expectedCurrentVersion,
           lastConnectTime,
         );
+        tAfterLockCheck = performance.now();
 
         const writeQueries = [];
         if (this.#pendingInstanceWrite) {
@@ -1093,12 +1106,12 @@ export class CVRStore {
         // Explicitly await all pipelined queries. When the begin callback is async,
         // postgres.js does not call Promise.all() on the return value the way it does
         // for sync callbacks, so we must do it ourselves.
-        return Promise.all(pipelined);
+        const result = await Promise.all(pipelined);
+        tAfterPipeline = performance.now();
+        return result;
       },
       {mode: Mode.READ_COMMITTED},
     );
-
-    lc.debug?.(`flush tx completed after ${Date.now() - start} ms`);
 
     // Calculate how many row update queries were in the pipeline.
     // Note: the version check was awaited separately and is not in the results array.
@@ -1128,6 +1141,14 @@ export class CVRStore {
     );
     recordRowsSynced(this.#rowCount);
 
+    this.#flushTiming = {
+      rowCheckMs: +(tAfterRowCheck - tFlushStart).toFixed(1),
+      txBeginMs: +(tTxBegun - tAfterRowCheck).toFixed(1),
+      lockCheckMs: +(tAfterLockCheck - tTxBegun).toFixed(1),
+      pipelineMs: +(tAfterPipeline - tAfterLockCheck).toFixed(1),
+      postTxMs: +(performance.now() - tAfterPipeline).toFixed(1),
+    };
+
     return stats;
   }
 
@@ -1154,7 +1175,8 @@ export class CVRStore {
         const elapsed = performance.now() - start;
         lc.info?.(
           `flushed cvr@${versionString(cvr.version)} ` +
-            `${JSON.stringify(stats)} in (${elapsed} ms)`,
+            `${JSON.stringify(stats)} in (${elapsed} ms) ` +
+            `timing=${JSON.stringify(this.#flushTiming)}`,
         );
         this.#rowCache.recordSyncFlushStats(stats, elapsed);
       }
