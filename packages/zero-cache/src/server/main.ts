@@ -209,6 +209,12 @@ export default async function runWorker(
         syncers,
         mutator,
         changeStreamer,
+        env.ZERO_LEAST_LOADED_ROUTING === '1'
+          ? path.join(
+              path.dirname(config.replica.file),
+              'syncer-assignments.json',
+            )
+          : undefined,
       ),
     );
   } catch (err) {
