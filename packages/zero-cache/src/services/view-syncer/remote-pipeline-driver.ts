@@ -66,34 +66,69 @@ type StreamPullResult =
   | {done: true};
 
 /**
+ * Per-advance IPC diagnostics. Populated as the stream progresses and read
+ * by ViewSyncer after the for-await loop drains. All durations are in ms.
+ *
+ * `postToBeginMs` and `postToCompleteMs` are on the syncer clock; the
+ * `poolToBegin/poolToComplete/gap/prev*` fields come straight from the
+ * pool thread via `advanceBegin` / `advanceComplete`.
+ */
+export type PoolTimings = {
+  postToBeginMs: number;
+  postToCompleteMs: number;
+  poolToBeginMs: number;
+  poolToCompleteMs: number;
+  gapSincePrevAdvanceMs: number;
+  prevAdvanceCgID: string | undefined;
+  prevAdvanceDurationMs: number | undefined;
+  batchCount: number;
+  poolThreadIdx: number;
+};
+
+type AdvanceBeginPayload = {
+  version: string;
+  numChanges: number;
+  snapshotMs: number;
+  poolToBeginMs: number;
+  gapSincePrevAdvanceMs: number;
+  prevAdvanceCgID: string | undefined;
+  prevAdvanceDurationMs: number | undefined;
+  poolThreadIdx: number;
+};
+
+/**
  * Push-pull buffer for a streaming `advance` response. Messages posted by
  * the pool thread are pushed here; the async iterable returned by
  * `advance()` pulls from it.
  */
 class AdvanceStream {
   readonly #buffered: Array<{type: 'batch'; batch: readonly RowChange[]}> = [];
-  #begin: {
-    version: string;
-    numChanges: number;
-    snapshotMs: number;
-  } | null = null;
+  #begin: AdvanceBeginPayload | null = null;
   #beginWaiter: {
-    resolve: (v: {
-      version: string;
-      numChanges: number;
-      snapshotMs: number;
-    }) => void;
+    resolve: (v: AdvanceBeginPayload) => void;
     reject: (err: Error) => void;
   } | null = null;
   #done = false;
   #error: Error | null = null;
   #waiter: StreamWaiter | null = null;
 
-  awaitBegin(): Promise<{
-    version: string;
-    numChanges: number;
-    snapshotMs: number;
-  }> {
+  /** Set by the proxy when postMessage('advance') is called. */
+  postTime = 0;
+  /** Set by the proxy when advanceBegin is observed on the port. */
+  beginTime = 0;
+  /** Set by the proxy when advanceComplete is observed on the port. */
+  completeTime = 0;
+  /** Filled from advanceBegin. */
+  poolToBeginMs = 0;
+  gapSincePrevAdvanceMs = 0;
+  prevAdvanceCgID: string | undefined = undefined;
+  prevAdvanceDurationMs: number | undefined = undefined;
+  poolThreadIdx = 0;
+  /** Filled from advanceComplete. */
+  poolToCompleteMs = 0;
+  batchCount = 0;
+
+  awaitBegin(): Promise<AdvanceBeginPayload> {
     if (this.#error) return Promise.reject(this.#error);
     if (this.#begin) return Promise.resolve(this.#begin);
     return new Promise((resolve, reject) => {
@@ -101,8 +136,15 @@ class AdvanceStream {
     });
   }
 
-  onBegin(version: string, numChanges: number, snapshotMs: number): void {
-    this.#begin = {version, numChanges, snapshotMs};
+  onBegin(payload: AdvanceBeginPayload): void {
+    this.#begin = payload;
+    // Mirror the diagnostic fields onto the stream so the driver can read
+    // them later without private access.
+    this.poolToBeginMs = payload.poolToBeginMs;
+    this.gapSincePrevAdvanceMs = payload.gapSincePrevAdvanceMs;
+    this.prevAdvanceCgID = payload.prevAdvanceCgID;
+    this.prevAdvanceDurationMs = payload.prevAdvanceDurationMs;
+    this.poolThreadIdx = payload.poolThreadIdx;
     if (this.#beginWaiter) {
       const w = this.#beginWaiter;
       this.#beginWaiter = null;
@@ -120,7 +162,9 @@ class AdvanceStream {
     this.#buffered.push({type: 'batch', batch: changes});
   }
 
-  onComplete(): void {
+  onComplete(poolToCompleteMs: number, batchCount: number): void {
+    this.poolToCompleteMs = poolToCompleteMs;
+    this.batchCount = batchCount;
     this.#done = true;
     if (this.#waiter) {
       const w = this.#waiter;
@@ -180,6 +224,11 @@ export class RemotePipelineDriver {
   #generation = 0;
   #destroyed = false;
 
+  // Diagnostics for the most recent advance (populated by `advance()` as the
+  // stream progresses; read by ViewSyncer's `#advancePipelines` after the
+  // stream drains). `null` until the first advance completes.
+  #lastTimings: PoolTimings | null = null;
+
   constructor(lc: LogContext, handle: PoolThreadHandle, clientGroupID: string) {
     this.#lc = lc.withContext('component', 'remote-pipeline-driver');
     this.#handle = handle;
@@ -192,6 +241,17 @@ export class RemotePipelineDriver {
 
   get poolThreadIdx(): number {
     return this.#handle.poolThreadIdx;
+  }
+
+  /**
+   * Returns the per-advance IPC timings collected during the most recent
+   * `advance()` call on this driver. Returns `null` if no advance has
+   * completed yet. Read by ViewSyncer after `#processChanges` drains the
+   * streamed changes; serialized via `#lock` so it's always the timings of
+   * the advance that just finished.
+   */
+  getLastAdvanceTimings(): PoolTimings | null {
+    return this.#lastTimings;
   }
 
   // -------------------------------------------------------------------------
@@ -364,6 +424,9 @@ export class RemotePipelineDriver {
     const requestId = this.#allocRequestId();
     const stream = new AdvanceStream();
     this.#streams.set(requestId, stream);
+    // Stamp `postTime` on the syncer clock *before* the postMessage so we
+    // capture the full round-trip including any event-loop delay.
+    stream.postTime = performance.now();
     this.#postMessage({
       type: 'advance',
       requestId,
@@ -473,14 +536,41 @@ export class RemotePipelineDriver {
     if (stream) {
       switch (msg.type) {
         case 'advanceBegin':
-          stream.onBegin(msg.version, msg.numChanges, msg.snapshotMs);
+          stream.beginTime = performance.now();
+          stream.onBegin({
+            version: msg.version,
+            numChanges: msg.numChanges,
+            snapshotMs: msg.snapshotMs,
+            poolToBeginMs: msg.poolToBeginMs,
+            gapSincePrevAdvanceMs: msg.gapSincePrevAdvanceMs,
+            prevAdvanceCgID: msg.prevAdvanceCgID,
+            prevAdvanceDurationMs: msg.prevAdvanceDurationMs,
+            poolThreadIdx: msg.poolThreadIdx,
+          });
           return;
         case 'advanceChangeBatch':
           stream.onBatch(msg.changes);
           return;
         case 'advanceComplete':
           this.#state = msg.state;
-          stream.onComplete();
+          stream.completeTime = performance.now();
+          stream.onComplete(msg.poolToCompleteMs, msg.batchCount);
+          // Snapshot the per-advance timings from the stream. The diagnostic
+          // fields from advanceBegin are mirrored onto the stream by
+          // `onBegin`, and the advanceComplete fields arrive in `msg`.
+          // ViewSyncer reads this via `getLastAdvanceTimings()` after the
+          // for-await loop drains.
+          this.#lastTimings = {
+            postToBeginMs: stream.beginTime - stream.postTime,
+            postToCompleteMs: stream.completeTime - stream.postTime,
+            poolToBeginMs: stream.poolToBeginMs,
+            poolToCompleteMs: msg.poolToCompleteMs,
+            gapSincePrevAdvanceMs: stream.gapSincePrevAdvanceMs,
+            prevAdvanceCgID: stream.prevAdvanceCgID,
+            prevAdvanceDurationMs: stream.prevAdvanceDurationMs,
+            batchCount: msg.batchCount,
+            poolThreadIdx: stream.poolThreadIdx,
+          };
           return;
         case 'error':
           stream.onError(this.#toError(msg));

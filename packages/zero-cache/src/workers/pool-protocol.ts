@@ -156,6 +156,28 @@ export type AdvanceBeginResult = {
   version: string;
   numChanges: number;
   snapshotMs: number;
+  /**
+   * Diagnostics — pool thread's own clock, relative durations (ms).
+   *
+   * These let the syncer compute the queue-wait and IPC components of the
+   * round-trip without having to reconcile the pool worker's
+   * `performance.now()` origin (which is different from the syncer's).
+   */
+  /** Duration inside the pool thread from message receive to this post. */
+  poolToBeginMs: number;
+  /**
+   * Pool-thread idle gap since the previous advance on the same thread
+   * ended. A value close to 0 while this advance's {@link queueWaitMs} is
+   * high directly implicates port-queue backlog (the previous advance
+   * kept the thread busy while this one waited in the port queue).
+   */
+  gapSincePrevAdvanceMs: number;
+  /** The `clientGroupID` of the previous advance on this pool thread. */
+  prevAdvanceCgID: string | undefined;
+  /** How long the previous advance on this pool thread took, ms. */
+  prevAdvanceDurationMs: number | undefined;
+  /** 0-indexed pool thread this message was handled on. */
+  poolThreadIdx: number;
 };
 
 /** A batch of row changes from an in-progress advance stream. */
@@ -175,6 +197,13 @@ export type AdvanceCompleteResult = {
   iterateMs: number;
   totalRows: number;
   state: DriverState;
+  /**
+   * Diagnostics — pool thread's own clock, relative durations (ms).
+   */
+  /** Duration inside the pool thread from message receive to this post. */
+  poolToCompleteMs: number;
+  /** Number of `advanceChangeBatch` messages sent during this advance. */
+  batchCount: number;
 };
 
 export type GetRowResult = {

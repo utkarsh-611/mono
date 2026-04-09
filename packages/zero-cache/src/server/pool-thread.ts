@@ -104,6 +104,16 @@ type ClientGroupState = {
 
 const clientGroups = new Map<string, ClientGroupState>();
 
+// Queueing diagnostics — one-shot telemetry to pin down the IPC gap.
+//
+// These track the previous advance that ran on this pool thread so the next
+// advance can compute `gapSincePrevAdvanceMs`. If the gap is near zero and
+// the syncer-observed `postToBeginMs` is high, the new advance was waiting
+// in the MessageChannel port queue while the previous one ran.
+let prevAdvanceCgID: string | undefined = undefined;
+let prevAdvanceDurationMs: number | undefined = undefined;
+let prevAdvanceEndTime = 0; // performance.now() when the previous advance finished
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -307,11 +317,23 @@ function handleRemoveQuery(
 }
 
 function handleAdvance(requestId: number, clientGroupID: string): void {
+  // Measured first thing: how long was this thread idle since the previous
+  // advance finished? A near-zero gap combined with a high syncer-observed
+  // `postToBeginMs` means this advance was queued on the port while the
+  // previous one ran.
+  const tEntry = performance.now();
+  const gapSincePrevAdvanceMs =
+    prevAdvanceEndTime > 0 ? tEntry - prevAdvanceEndTime : 0;
+  const capturedPrevCg = prevAdvanceCgID;
+  const capturedPrevDur = prevAdvanceDurationMs;
+
   const state = requireState(clientGroupID);
   const timer = createTimer();
-  const t0 = performance.now();
   const {version, numChanges, snapshotMs, changes} =
     state.driver.advance(timer);
+
+  const tBeforeBegin = performance.now();
+  const poolToBeginMs = tBeforeBegin - tEntry;
 
   send({
     type: 'advanceBegin',
@@ -320,15 +342,22 @@ function handleAdvance(requestId: number, clientGroupID: string): void {
     version,
     numChanges,
     snapshotMs,
+    poolToBeginMs,
+    gapSincePrevAdvanceMs,
+    prevAdvanceCgID: capturedPrevCg,
+    prevAdvanceDurationMs: capturedPrevDur,
+    poolThreadIdx,
   });
 
   let batch: RowChange[] = [];
   let totalRows = 0;
+  let batchCount = 0;
   let didReset = false;
 
   const flush = () => {
     if (batch.length > 0) {
       totalRows += batch.length;
+      batchCount++;
       send({
         type: 'advanceChangeBatch',
         requestId,
@@ -347,6 +376,7 @@ function handleAdvance(requestId: number, clientGroupID: string): void {
       batch.push(change);
       if (batch.length >= BATCH_SIZE) {
         totalRows += batch.length;
+        batchCount++;
         send({
           type: 'advanceChangeBatch',
           requestId,
@@ -394,6 +424,7 @@ function handleAdvance(requestId: number, clientGroupID: string): void {
         batch.push(change);
         if (batch.length >= BATCH_SIZE) {
           totalRows += batch.length;
+          batchCount++;
           send({
             type: 'advanceChangeBatch',
             requestId,
@@ -407,11 +438,21 @@ function handleAdvance(requestId: number, clientGroupID: string): void {
     }
   }
 
-  const iterateMs = performance.now() - t0 - snapshotMs;
+  const tEnd = performance.now();
+  const iterateMs = tEnd - tEntry - snapshotMs;
+  const poolToCompleteMs = tEnd - tEntry;
+  // The pool-thread log line already fires once per advance — we just add
+  // the new fields to it so there are no extra log calls in the hot path.
   lc.info?.(
     `advanced clientGroup=${clientGroupID} to=${version} ` +
       `changes=${numChanges} rows=${totalRows} didReset=${didReset} ` +
-      `snapshotMs=${snapshotMs.toFixed(2)} iterateMs=${iterateMs.toFixed(1)}`,
+      `snapshotMs=${snapshotMs.toFixed(2)} iterateMs=${iterateMs.toFixed(1)} ` +
+      `poolToBeginMs=${poolToBeginMs.toFixed(2)} ` +
+      `poolToCompleteMs=${poolToCompleteMs.toFixed(1)} ` +
+      `batchCount=${batchCount} ` +
+      `gapSincePrevAdvanceMs=${gapSincePrevAdvanceMs.toFixed(1)} ` +
+      `prevCg=${capturedPrevCg ?? '-'} ` +
+      `prevDurMs=${capturedPrevDur !== undefined ? capturedPrevDur.toFixed(1) : '-'}`,
   );
   send({
     type: 'advanceComplete',
@@ -421,7 +462,15 @@ function handleAdvance(requestId: number, clientGroupID: string): void {
     iterateMs,
     totalRows,
     state: snapshotState(state),
+    poolToCompleteMs,
+    batchCount,
   });
+
+  // Update the rolling "prev advance" state for the next handleAdvance
+  // invocation on this pool thread.
+  prevAdvanceCgID = clientGroupID;
+  prevAdvanceDurationMs = poolToCompleteMs;
+  prevAdvanceEndTime = tEnd;
 }
 
 function handleGetRow(

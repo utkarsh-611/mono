@@ -82,7 +82,7 @@ import type {DrainCoordinator} from './drain-coordinator.ts';
 import {handleInspect} from './inspect-handler.ts';
 import type {PipelineDriver} from './pipeline-driver.ts';
 import {type RowChange} from './pipeline-driver.ts';
-import type {RemotePipelineDriver} from './remote-pipeline-driver.ts';
+import {RemotePipelineDriver} from './remote-pipeline-driver.ts';
 
 /**
  * Either the in-process stock `PipelineDriver` or the `RemotePipelineDriver`
@@ -2136,6 +2136,35 @@ export class ViewSyncerService implements ViewSyncer, ActivityBasedService {
       const pokeMs = tEnd - tAfterCVR;
       const wallTime = tEnd - tStart;
 
+      // Pool-thread IPC diagnostics, only when running on RemotePipelineDriver.
+      // Zero new log lines — the fields are appended to the existing
+      // "finished processing advancement" entry. Null on stock driver.
+      let poolDiag = '';
+      if (this.#pipelines instanceof RemotePipelineDriver) {
+        const t = this.#pipelines.getLastAdvanceTimings();
+        if (t !== null) {
+          const queueWaitMs = Math.max(0, t.postToBeginMs - t.poolToBeginMs);
+          const streamMs = Math.max(
+            0,
+            t.postToCompleteMs -
+              t.postToBeginMs -
+              (t.poolToCompleteMs - t.poolToBeginMs),
+          );
+          poolDiag =
+            `, postToBeginMs: ${t.postToBeginMs.toFixed(1)}` +
+            `, postToCompleteMs: ${t.postToCompleteMs.toFixed(1)}` +
+            `, poolToBeginMs: ${t.poolToBeginMs.toFixed(2)}` +
+            `, poolToCompleteMs: ${t.poolToCompleteMs.toFixed(1)}` +
+            `, queueWaitMs: ${queueWaitMs.toFixed(1)}` +
+            `, streamMs: ${streamMs.toFixed(1)}` +
+            `, gapSincePrevMs: ${t.gapSincePrevAdvanceMs.toFixed(1)}` +
+            `, prevDurMs: ${t.prevAdvanceDurationMs !== undefined ? t.prevAdvanceDurationMs.toFixed(1) : '-'}` +
+            `, prevCg: ${t.prevAdvanceCgID ?? '-'}` +
+            `, batchCount: ${t.batchCount}` +
+            `, poolThreadIdx: ${t.poolThreadIdx}`;
+        }
+      }
+
       lc.info?.(
         `finished processing advancement of ${numChanges} changes ` +
           `((process: ${totalProcessTime} ms, wall: ${wallTime.toFixed(1)} ms, ` +
@@ -2143,7 +2172,7 @@ export class ViewSyncerService implements ViewSyncer, ActivityBasedService {
           `snapshotMs: ${snapshotMs.toFixed(2)}, ` +
           `ivmMs: ${ivmMs.toFixed(1)}, ` +
           `cvrFlushMs: ${cvrFlushMs.toFixed(1)}, ` +
-          `pokeMs: ${pokeMs.toFixed(1)}))`,
+          `pokeMs: ${pokeMs.toFixed(1)}${poolDiag}))`,
       );
       this.#transactionAdvanceTime.record(totalProcessTime / 1000);
       return 'success';
