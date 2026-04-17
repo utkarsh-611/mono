@@ -140,6 +140,9 @@ describe('change-source/pg/end-to-mid-test', {timeout: 30000}, () => {
         case 'rollback':
         case 'control':
         case 'status':
+          if (data.length === 0) {
+            break; // skip empty transactions
+          }
           return data;
         default:
           change satisfies never;
@@ -908,7 +911,7 @@ describe('change-source/pg/end-to-mid-test', {timeout: 30000}, () => {
     [
       'add unpublished column',
       'ALTER TABLE foo ADD "newInt" INT4;',
-      [[]], // no DDL event published
+      [], // no DDL event published
       {},
       [
         // the view of "foo" is unchanged.
@@ -1081,7 +1084,7 @@ describe('change-source/pg/end-to-mid-test', {timeout: 30000}, () => {
     [
       'create unpublished table with indexes',
       'CREATE TABLE public.boo (id INT8 PRIMARY KEY, name TEXT UNIQUE);',
-      [[]],
+      [],
       {},
       [],
       [],
@@ -1958,9 +1961,30 @@ describe('change-source/pg/end-to-mid-test', {timeout: 30000}, () => {
       ],
       [],
     ],
+    [
+      'concurrent schema changes',
+      [
+        // statements are run in parallel
+        `CREATE TABLE IF NOT EXISTS your.t0 (id INT8 PRIMARY KEY)`,
+        `CREATE TABLE IF NOT EXISTS your.t1 (id INT8 PRIMARY KEY)`,
+        `CREATE TABLE IF NOT EXISTS your.t2 (id INT8 PRIMARY KEY)`,
+      ],
+      [
+        [{tag: 'create-table'}, {tag: 'create-index'}],
+        [{tag: 'create-table'}, {tag: 'create-index'}],
+        [{tag: 'create-table'}, {tag: 'create-index'}],
+      ],
+      {
+        ['your.t0']: [],
+        ['your.t1']: [],
+        ['your.t2']: [],
+      },
+      [],
+      [],
+    ],
   ] satisfies [
     name: string,
-    statements: string,
+    statements: string | string[],
     transactions: Partial<DataOrSchemaChange>[][],
     expectedData: Record<string, JSONValue>,
     expectedTables: LiteTableSpec[],
@@ -1975,7 +1999,8 @@ describe('change-source/pg/end-to-mid-test', {timeout: 30000}, () => {
       expectedTables,
       expectedIndexes,
     ) => {
-      await upstream.unsafe(stmts);
+      stmts = Array.isArray(stmts) ? stmts : [stmts];
+      await Promise.all(stmts.map(stmt => upstream.unsafe(stmt)));
       for (const changes of transactions) {
         const transaction = await nextTransaction();
         expect(transaction).toMatchObject(changes);
