@@ -209,6 +209,10 @@ function nullableAwareRangeComparison(
   operator: '>' | '<',
   columnType: SchemaValue,
 ): SQLQuery {
+  // For non-nullable columns, skip IS NULL checks to avoid breaking
+  // SQLite's MULTI-INDEX OR optimization, which falls back to a full
+  // table scan when any OR branch involves NULL.
+  // See: https://github.com/rocicorp/mono/pull/5542
   const comparison = sql`${sql.ident(field)} ${sql.__dangerous__rawValue(
     operator,
   )} ${value}`;
@@ -253,10 +257,6 @@ function gatherStartConstraints(
       if (j === i) {
         const columnType = columnTypes[iField];
         const constraintValue = toSQLiteType(from[iField], columnType.type);
-        // For non-nullable columns, skip IS NULL checks to avoid
-        // breaking SQLite's MULTI-INDEX OR optimization which falls
-        // back to a full table scan when any OR branch involves NULL.
-        // See: https://github.com/rocicorp/mono/pull/5542
         const operator =
           iDirection === 'asc' ? (reverse ? '<' : '>') : reverse ? '>' : '<';
         group.push(
