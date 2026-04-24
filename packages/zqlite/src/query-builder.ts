@@ -193,6 +193,34 @@ export function toSQLiteType(v: unknown, type: ValueType): unknown {
   }
 }
 
+function nullableAwareEquality(
+  field: string,
+  value: unknown,
+  columnType: SchemaValue,
+): SQLQuery {
+  return columnType.optional === true
+    ? sql`${sql.ident(field)} IS ${value}`
+    : sql`${sql.ident(field)} = ${value}`;
+}
+
+function nullableAwareRangeComparison(
+  field: string,
+  value: unknown,
+  operator: '>' | '<',
+  columnType: SchemaValue,
+): SQLQuery {
+  const comparison = sql`${sql.ident(field)} ${sql.__dangerous__rawValue(
+    operator,
+  )} ${value}`;
+  if (columnType.optional !== true) {
+    return comparison;
+  }
+
+  return operator === '>'
+    ? sql`(${value} IS NULL OR ${comparison})`
+    : sql`(${sql.ident(field)} IS NULL OR ${comparison})`;
+}
+
 /**
  * The ordering could be complex such as:
  * `ORDER BY a ASC, b DESC, c ASC`
@@ -223,61 +251,29 @@ function gatherStartConstraints(
     const [iField, iDirection] = order[i];
     for (let j = 0; j <= i; j++) {
       if (j === i) {
-        const constraintValue = toSQLiteType(
-          from[iField],
-          columnTypes[iField].type,
-        );
+        const columnType = columnTypes[iField];
+        const constraintValue = toSQLiteType(from[iField], columnType.type);
         // For non-nullable columns, skip IS NULL checks to avoid
         // breaking SQLite's MULTI-INDEX OR optimization which falls
         // back to a full table scan when any OR branch involves NULL.
         // See: https://github.com/rocicorp/mono/pull/5542
-        const isOptional = columnTypes[iField].optional === true;
-        if (iDirection === 'asc') {
-          if (!reverse) {
-            group.push(
-              isOptional
-                ? sql`(${constraintValue} IS NULL OR ${sql.ident(iField)} > ${constraintValue})`
-                : sql`${sql.ident(iField)} > ${constraintValue}`,
-            );
-          } else {
-            reverse satisfies true;
-            group.push(
-              isOptional
-                ? sql`(${sql.ident(iField)} IS NULL OR ${sql.ident(iField)} < ${constraintValue})`
-                : sql`${sql.ident(iField)} < ${constraintValue}`,
-            );
-          }
-        } else {
-          iDirection satisfies 'desc';
-          if (!reverse) {
-            group.push(
-              isOptional
-                ? sql`(${sql.ident(iField)} IS NULL OR ${sql.ident(iField)} < ${constraintValue})`
-                : sql`${sql.ident(iField)} < ${constraintValue}`,
-            );
-          } else {
-            reverse satisfies true;
-            group.push(
-              isOptional
-                ? sql`(${constraintValue} IS NULL OR ${sql.ident(iField)} > ${constraintValue})`
-                : sql`${sql.ident(iField)} > ${constraintValue}`,
-            );
-          }
-        }
+        const operator =
+          iDirection === 'asc' ? (reverse ? '<' : '>') : reverse ? '>' : '<';
+        group.push(
+          nullableAwareRangeComparison(
+            iField,
+            constraintValue,
+            operator,
+            columnType,
+          ),
+        );
       } else {
         const [jField] = order[j];
-        const jIsOptional = columnTypes[jField].optional === true;
-        const jValue = toSQLiteType(
-          from[jField],
-          columnTypes[jField].type,
-        );
+        const columnType = columnTypes[jField];
+        const value = toSQLiteType(from[jField], columnType.type);
         // Use = instead of IS for non-nullable columns to enable
         // better index usage in SQLite.
-        group.push(
-          jIsOptional
-            ? sql`${sql.ident(jField)} IS ${jValue}`
-            : sql`${sql.ident(jField)} = ${jValue}`,
-        );
+        group.push(nullableAwareEquality(jField, value, columnType));
       }
     }
     constraints.push(sql`(${sql.join(group, sql` AND `)})`);
@@ -286,15 +282,10 @@ function gatherStartConstraints(
   if (basis === 'at') {
     constraints.push(
       sql`(${sql.join(
-        order.map(s => {
-          const sIsOptional = columnTypes[s[0]].optional === true;
-          const sValue = toSQLiteType(
-            from[s[0]],
-            columnTypes[s[0]].type,
-          );
-          return sIsOptional
-            ? sql`${sql.ident(s[0])} IS ${sValue}`
-            : sql`${sql.ident(s[0])} = ${sValue}`;
+        order.map(([field]) => {
+          const columnType = columnTypes[field];
+          const value = toSQLiteType(from[field], columnType.type);
+          return nullableAwareEquality(field, value, columnType);
         }),
         sql` AND `,
       )})`,
