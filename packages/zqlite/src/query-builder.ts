@@ -198,6 +198,8 @@ function nullableAwareEquality(
   value: unknown,
   columnType: SchemaValue,
 ): SQLQuery {
+  // Use = instead of IS for non-nullable columns to enable better
+  // index usage in SQLite.
   return columnType.optional === true
     ? sql`${sql.ident(field)} IS ${value}`
     : sql`${sql.ident(field)} = ${value}`;
@@ -271,8 +273,6 @@ function gatherStartConstraints(
         const [jField] = order[j];
         const columnType = columnTypes[jField];
         const value = toSQLiteType(from[jField], columnType.type);
-        // Use = instead of IS for non-nullable columns to enable
-        // better index usage in SQLite.
         group.push(nullableAwareEquality(jField, value, columnType));
       }
     }
